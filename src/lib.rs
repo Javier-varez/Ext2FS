@@ -1,3 +1,5 @@
+use num::Integer;
+
 #[repr(C)]
 struct Ext2SuperBlock {
     s_inodes_count: u32,      /* Inodes count */
@@ -6,7 +8,7 @@ struct Ext2SuperBlock {
     s_free_blocks_count: u32, /* Free blocks count */
     s_free_inodes_count: u32, /* Free inodes count */
     s_first_data_block: u32,  /* First Data Block */
-    s_log_block_size: u32,    /* Block size */
+    s_log_block_size: i32,    /* Block size */
     s_log_frag_size: u32,     /* Fragment size */
     s_blocks_per_group: u32,  /* # Blocks per group */
     s_frags_per_group: u32,   /* # Fragments per group */
@@ -71,41 +73,124 @@ struct Ext2SuperBlock {
     s_reserved: [u32; 190], /* Padding to the end of the block */
 }
 
+#[derive(Default)]
+struct Ext2GroupDescriptor {
+    bg_block_bitmap: u32,
+    bg_inode_bitmap: u32,
+    bg_inode_table: u32,
+    bg_free_blocks_count: u16,
+    bg_free_inodes_count: u16,
+    bg_used_dirs_count: u16,
+    bg_flags: u16,
+    bg_reserved: u32,
+    bg_itable_unused: u16,
+    bg_checksum: u16,
+}
+
 /// Trait for a block device. It reads/writes in chunks given by the block size
 pub trait BlockDevice {
-    /// Reads a block from the device. The size of the returned block can be obtained with
+    /// Reads multiple blocks from the device. The size of the returned block can be obtained with
     /// `get_block_size`
-    fn read_block(&self, index: usize) -> Vec<u8>;
+    fn read_blocks(&self, index: usize, num_blocks: usize) -> Vec<u8>;
 
-    /// Writes a block to the device. The size of the block can be obtained with
+    /// Writes to the device. The size of the block can be obtained with
     /// `get_block_size`
-    fn write_block(&mut self, index: usize, data: &[u8]);
+    fn write_blocks(&mut self, index: usize, data: &[u8]);
 
     /// Returns the block size of the device
     fn get_block_size(&self) -> usize;
 }
 
+#[derive(Debug)]
+pub enum Error {
+    NoFilesystemFound,
+}
+
 /// Representation of an ext2 filesystem
 pub struct Ext2Fs<T: BlockDevice> {
     device: T,
+    superblock: Option<Ext2SuperBlock>,
+    cached_group_descriptor: Ext2GroupDescriptor,
+    block_size: usize,
+    num_block_groups: usize,
 }
 
 impl<T: BlockDevice> Ext2Fs<T> {
+    const DEFAULT_BLOCK_SIZE: usize = 1024;
+    const SUPERBLOCK_OFFSET: usize = 1024;
+
     /// Constructor for an ext2 filesystem. It takes ownership of the underlying block device.
     pub fn new(device: T) -> Self {
-        Ext2Fs { device }
+        Ext2Fs {
+            device,
+            superblock: None,
+            cached_group_descriptor: Default::default(),
+            block_size: 1024,
+            num_block_groups: 0,
+        }
     }
 
-    /// Reads the superblock and returns it to the user.
-    fn read_superblock(&mut self) -> Ext2SuperBlock {
-        // The superblock is always located at a 1024 byte offset in the disk
-        let superblock_index = 1024 / self.device.get_block_size();
+    fn read_superblock(&mut self) -> Result<Ext2SuperBlock, Error> {
+        let block_size = self.device.get_block_size();
 
-        let block = self.device.read_block(superblock_index);
-        let ext_ptr = block.as_ptr() as *const Ext2SuperBlock;
-        let superblock: std::mem::MaybeUninit<Ext2SuperBlock> =
-            unsafe { std::mem::transmute_copy(&*ext_ptr) };
-        unsafe { superblock.assume_init() }
+        // The superblock is located at a fixed 1024 byte offset in the disk
+        let index = Self::SUPERBLOCK_OFFSET / block_size;
+        let offset = Self::SUPERBLOCK_OFFSET % block_size;
+        let block_count = if std::mem::size_of::<Ext2SuperBlock>() > (block_size - offset) {
+            let remaining_bytes = std::mem::size_of::<Ext2SuperBlock>() - (block_size - offset);
+            1 + remaining_bytes.div_ceil(&block_size)
+        } else {
+            1
+        };
+
+        let superblock_data = self.device.read_blocks(index, block_count);
+        let superblock_ptr = superblock_data[offset..].as_ptr() as *const Ext2SuperBlock;
+        // SAFETY: 1. It is guaranteed that superblock_ptr will contain enough data for the
+        //            superblock, since we read enough data.
+        //         2. since the superblock is made of primitive types, its state cannot be invalid.
+        //         3. Layout is guaranteed, the Ext2SuperBlock struct is declared with repr(C)
+        let superblock: Ext2SuperBlock = unsafe { std::mem::transmute_copy(&*superblock_ptr) };
+
+        if superblock.s_magic != 0xEF53 {
+            return Err(Error::NoFilesystemFound);
+        }
+
+        Ok(superblock)
+    }
+
+    pub fn initialize(&mut self) -> Result<(), Error> {
+        self.superblock = Some(self.read_superblock()?);
+        let superblock = self.superblock.as_ref().unwrap();
+
+        // Get block size
+        let log_block_size = superblock.s_log_block_size;
+        self.block_size = if log_block_size < 0 {
+            Self::DEFAULT_BLOCK_SIZE >> -log_block_size
+        } else {
+            Self::DEFAULT_BLOCK_SIZE << log_block_size
+        };
+
+        // Extract number of block groups
+        self.num_block_groups = superblock
+            .s_blocks_count
+            .div_ceil(&superblock.s_blocks_per_group) as usize;
+
+        Ok(())
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    pub fn num_block_groups(&self) -> usize {
+        self.num_block_groups
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        if let Some(superblock) = self.superblock.as_ref() {
+            return superblock.s_blocks_count as usize;
+        }
+        0
     }
 }
 
@@ -119,6 +204,8 @@ mod tests {
     }
 
     impl FileDevice {
+        const BLOCK_SIZE: usize = 1024;
+
         fn new(path: &std::path::Path) -> Self {
             let mut file = std::fs::File::open(path).unwrap();
             let mut dev = FileDevice { data: vec![] };
@@ -128,32 +215,39 @@ mod tests {
     }
 
     impl BlockDevice for FileDevice {
-        fn read_block(&self, index: usize) -> Vec<u8> {
+        fn read_blocks(&self, index: usize, num_blocks: usize) -> Vec<u8> {
             self.data
                 .iter()
                 .cloned()
-                .skip(index * 1024)
-                .take(1024)
+                .skip(index * FileDevice::BLOCK_SIZE)
+                .take(FileDevice::BLOCK_SIZE * num_blocks)
                 .collect()
         }
 
-        fn write_block(&mut self, _index: usize, _data: &[u8]) {}
+        fn write_blocks(&mut self, _index: usize, _data: &[u8]) {}
 
         fn get_block_size(&self) -> usize {
-            1024
+            FileDevice::BLOCK_SIZE
         }
     }
 
     #[test]
     fn read_superblock() {
-        // let path = std::path::PathBuf::from("/home/javier/Documents/code/ext2fs/ext2fs/ext2fs.bin");
         let path = std::path::PathBuf::from("ext2fs.bin");
         let dev = FileDevice::new(&path);
         let mut ext2fs = Ext2Fs::new(dev);
 
-        let superblock = ext2fs.read_superblock();
+        ext2fs.initialize().unwrap();
+        let superblock = ext2fs.superblock.as_ref().unwrap();
         assert_eq!(superblock.s_magic, 0xEF53);
         assert_eq!(superblock.s_creator_os, 0);
         assert_eq!(superblock.s_state, 1);
+        assert_eq!(superblock.s_blocks_per_group, 32768); // 32768 blocks per group
+        assert_eq!(superblock.s_log_block_size, 2); // 4096 bytes/ block
+        assert_eq!(superblock.s_block_group_nr, 0);
+
+        assert_eq!(ext2fs.block_size(), 4096);
+        assert_eq!(ext2fs.num_block_groups(), 1);
+        assert_eq!(ext2fs.num_blocks(), 256);
     }
 }
